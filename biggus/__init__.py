@@ -171,11 +171,12 @@ class ProducerNode(Node):
     `OrthoArrayAdapater`, `ArrayStack`, and `LinearMosaic`.
 
     """
-    def __init__(self, array, iteration_order, masked):
+    def __init__(self, array, iteration_order, masked, preserve=None):
         assert array.ndim == len(iteration_order)
         self.array = array
         self.iteration_order = iteration_order
         self.masked = masked
+        self.preserve = preserve if preserve is not None else ()
         super(ProducerNode, self).__init__()
 
     def run(self):
@@ -198,7 +199,8 @@ class ProducerNode(Node):
             # indentified the relevant slices.
             all_cuts = _all_slices_inner(self.array.dtype.itemsize,
                                          self.array.shape,
-                                         always_slices=True)
+                                         always_slices=True,
+                                         preserve=self.preserve)
             all_cuts = [all_cuts[i] for i in self.iteration_order]
             cut_shape = tuple(len(cuts) for cuts in all_cuts)
             inverse_order = [self.iteration_order.index(i) for
@@ -386,7 +388,7 @@ class AllThreadedEngine(Engine):
         def __repr__(self):
             return 'Group({}, {})'.format(self.arrays, self.indices)
 
-        def _make_node(self, array, iteration_order, masked):
+        def _make_node(self, array, iteration_order, masked, preserve=None):
             cache_key = id(array)
             node = self._node_cache.get(cache_key, None)
             if node is None:
@@ -395,12 +397,34 @@ class AllThreadedEngine(Engine):
                                               array.streams_handler(masked))
                     iteration_order = node.input_iteration_order(
                         iteration_order)
-                    input_nodes = [self._make_node(input_array,
-                                                   iteration_order, masked)
-                                   for input_array in array.sources]
+                    if hasattr(array, 'preserve'):
+                        if preserve is None:
+                            preserve = array.preserve
+                        else:
+                            preserve = tuple(set(preserve).union(
+                                array.preserve))
+                    input_nodes = []
+                    for input_array in array.sources:
+                        input_preserve = preserve
+                        if preserve:
+                            if isinstance(input_array, (_Aggregation,
+                                                        _Callback)) and \
+                                input_array.axis is not None:
+                                axis = input_array.axis
+                                input_preserve = [d if d < axis else d + 1 
+                                                  for d in preserve]
+                        input_nodes.append(self._make_node(input_array,
+                                                           iteration_order, masked,
+                                                           preserve=input_preserve))
+
+                    # input_nodes = [self._make_node(input_array,
+                    #                                iteration_order, masked,
+                    #                                preserve=preserve)
+                    #                for input_array in array.sources]
                     node.add_input_nodes(input_nodes)
                 else:
-                    node = ProducerNode(array, iteration_order, masked)
+                    node = ProducerNode(array, iteration_order, masked,
+                                        preserve=preserve)
                 self._node_cache[cache_key] = node
             return node
 
@@ -1274,6 +1298,18 @@ def ndarrays(arrays):
     return engine.ndarrays(*arrays)
 
 
+def masked_arrays(arrays):
+    """
+    Return a list of MaskedArray objects corresponding to the given
+    biggus Array objects.
+
+    This can be more efficient (and hence faster) than converting the
+    individual arrays one by one.
+
+    """
+    return engine.masked_arrays(*arrays)
+
+
 #: The maximum number of bytes to allow when processing an array in
 #: "bite-size" chunks. The value has been empirically determined to
 #: provide vaguely near optimal performance under certain conditions.
@@ -1284,7 +1320,7 @@ def _all_slices(array):
     return _all_slices_inner(array.dtype.itemsize, array.shape)
 
 
-def _all_slices_inner(item_size, shape, always_slices=False):
+def _all_slices_inner(item_size, shape, always_slices=False, preserve=None):
     # Return the slices for each dimension which ensure complete
     # coverage by chunks no larger than MAX_CHUNK_SIZE.
     # e.g. For a float32 array of shape (100, 768, 1024) the slices are:
@@ -1293,21 +1329,45 @@ def _all_slices_inner(item_size, shape, always_slices=False):
     #   (slice(None)
     nbytes = item_size
     all_slices = []
+    max_chunk_size = MAX_CHUNK_SIZE
+
+    if preserve:
+        mapping = []
+        reshape = []
+        for dim, s in enumerate(shape):
+            if dim not in preserve:
+                mapping.append(dim)
+                reshape.append(s)
+        for dim in preserve:
+            mapping.append(dim)
+            reshape.append(shape[dim])
+        shape = reshape
+        size = reduce(lambda x, y: x * y, reshape[-len(preserve):], item_size)
+        if size > max_chunk_size:
+            max_chunk_size = size
+
     for i, size in reversed(list(enumerate(shape))):
-        if size * nbytes <= MAX_CHUNK_SIZE:
+        if size * nbytes <= max_chunk_size:
             slices = (slice(None),)
-        elif nbytes > MAX_CHUNK_SIZE:
+        elif nbytes > max_chunk_size:
             if always_slices:
                 slices = [slice(i, i + 1) for i in range(size)]
             else:
                 slices = range(size)
         else:
-            step = MAX_CHUNK_SIZE // nbytes
+            step = max_chunk_size // nbytes
             slices = []
             for start in range(0, size, step):
                 slices.append(slice(start, np.min([start + step, size])))
         nbytes *= size
         all_slices.insert(0, slices)
+
+    if preserve:
+        tmp = [None] * len(shape)
+        for dim, s in zip(mapping, all_slices):
+            tmp[dim] = s
+        all_slices = tmp
+
     return all_slices
 
 
@@ -1746,6 +1806,10 @@ class _Aggregation(ComputedArray):
         self._kwargs = kwargs
 
     @property
+    def axis(self):
+        return self._axis
+
+    @property
     def dtype(self):
         return self._dtype
 
@@ -2109,6 +2173,148 @@ def sub(a, b):
 
     """
     return _Elementwise(a, b, np.subtract, np.ma.subtract)
+
+
+class _CallbackStreamsHandler(_StreamsHandler):
+    def __init__(self, sources, func, axis, preserve, dtype, masked, kwargs):
+        self.sources = sources
+        self.func = func
+        self.axis = axis
+        self.preserve = preserve
+        self.dtype = dtype
+        self.masked = masked
+        self.kwargs = kwargs
+
+    def finalise(self):
+        pass
+
+    def input_iteration_order(self, iteration_order):
+        if self.axis is not None:
+            iteration_order.append(len(iteration_order))
+        return iteration_order
+
+    def process_chunks(self, chunks):
+        chunks = self.func(chunks, axis=self.axis, preserve=self.preserve,
+                           dtype=self.dtype, masked=self.masked, **self.kwargs)
+        return chunks
+
+
+class _Callback(ComputedArray):
+    def __init__(self, func, arrays, axis, preserve, dtype, kwargs):
+        if not isinstance(func, collections.Callable):
+            raise TypeError('Require a callable callback.')
+        self._func = func
+
+        for array in arrays:
+            if not isinstance(array, Array):
+                msg = 'Expecting a biggus array instance, got {}.'
+                raise TypeError(msg.format(type(array)))
+        self._arrays = arrays
+        # TODO: Broadcasting
+        shape = arrays[0].shape
+        for array in arrays:
+            assert array.shape == shape
+        # TODO: Type-promotion
+        dtype = arrays[0].dtype
+        for array in arrays:
+            assert dtype == array.dtype
+
+        axis = _normalise_axis(axis, self._arrays[0])
+        self._axis = axis
+        if axis is not None:
+            if len(axis) != 1:
+                msg = 'This operation is currently limited to a single axis.'
+                raise AxisSupportError(msg)
+            self._axis, = axis
+
+        if preserve is None or isinstance(preserve, basestring):
+            preserve = []
+        if not isinstance(preserve, collections.Iterable):
+            preserve = [preserve]
+        unique_preserve = set(preserve)
+        if unique_preserve.intersection(range(len(shape))) != unique_preserve:
+            raise ValueError('Cannot preserve non-existing dimension/s.')
+        self.preserve = tuple(unique_preserve)
+
+        self._dtype = self._arrays[0].dtype if dtype is None else dtype
+        self._kwargs = kwargs
+
+    @property
+    def axis(self):
+        return self._axis
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def shape(self):
+        shape = list(self._arrays[0].shape)
+        if self._axis is not None:
+            del shape[self._axis]
+        return tuple(shape)
+
+    @property
+    def sources(self):
+        return self._arrays
+
+    def __getitem__(self, keys):
+        keys = self._normalise_keys(keys)
+        axis = self._axis
+        preserve = self.preserve
+        if axis is not None:
+            keys = list(keys)
+            keys[self._axis:self._axis] = [slice(None)]
+            if len(keys) < self._arrays[0].ndim:
+                extra = [slice(None)] * (self._arrays[0].ndim - len(keys))
+                keys = keys + extra
+            keys = tuple(keys)
+            scalar_axes = map(_is_scalar, keys)
+            axis = self._axis - __builtin__.sum(scalar_axes[:self._axis])
+            dim_preserve = []
+            for dim in preserve:
+                if not scalar_axes[dim]:
+                    collapsed = __builtin__.sum(scalar_axes[:dim])
+                    dim_preserve.append(dim - collapsed)
+            preserve = tuple(dim_preserve)
+        arrays = [array[keys] for array in self._arrays]
+        return _Callback(self._func, arrays, axis, preserve, self._dtype, self._kwargs)
+
+    def ndarray(self):
+        result, = engine.ndarrays(self)
+        return result
+
+    def masked_array(self):
+        result, = engine.masked_arrays(self)
+        return result
+
+    def streams_handler(self, masked):
+        return _CallbackStreamsHandler(self.sources, self._func, self._axis,
+                                       self.preserve, self.dtype, masked,
+                                       self._kwargs)
+
+
+def callback(func, *arrays, **kwargs):
+    """
+    Return the callback custom evaluation as another Array.
+
+    """
+    axis = kwargs.pop('axis', None)
+    preserve = kwargs.pop('preserve', None)
+    dtype = kwargs.pop('dtype', None)
+    return _Callback(func, arrays, axis, preserve, dtype, kwargs)
+
+
+def register_callback(func):
+    def inner(chunks, **kwargs):
+        data = [chunk.data for chunk in chunks]
+        keys = list(chunks[0].keys)
+        axis = kwargs['axis']
+        if axis is not None:
+            del keys[axis]
+        result = func(*data, **kwargs)
+        return Chunk(keys, result)
+    return inner
 
 
 # TODO: Test
